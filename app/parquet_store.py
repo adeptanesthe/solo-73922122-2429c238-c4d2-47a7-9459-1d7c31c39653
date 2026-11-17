@@ -160,3 +160,54 @@ def list_parquet_files() -> list[Path]:
             if p.is_file() and not p.name.startswith(".tmp."):
                 files.append(p)
     return files
+
+
+# ---------------------------------------------------------------- 日统计读取
+
+def read_rows_in_range(
+    path: Path, start: dt.date, end: dt.date
+) -> list[tuple[str, dt.date, int]]:
+    """读取冻结批次中日期落在 [start, end] 的行（列裁剪 + 过滤下推）。"""
+    table = pq.read_table(path, schema=SCHEMA, filters=[("date", ">=", start), ("date", "<=", end)])
+    if table.num_rows == 0:
+        return []
+    subjects = table.column("subject_id").to_pylist()
+    dates = table.column("date").to_pylist()
+    steps = table.column("steps").to_pylist()
+    return list(zip(subjects, dates, steps))
+
+
+def subjects_in_date_range(path: Path, start: dt.date, end: dt.date) -> set[str]:
+    """冻结文件在给定日期区间内出现过的受试者集合（只读取两列）。"""
+    table = pq.read_table(
+        path,
+        columns=["subject_id", "date"],
+        filters=[("date", ">=", start), ("date", "<=", end)],
+    )
+    if table.num_rows == 0:
+        return set()
+    return set(pc.unique(table.column("subject_id")).to_pylist())
+
+
+STATS_RESULT_SCHEMA = pa.schema(
+    [
+        pa.field("stat_date", pa.date32(), nullable=False),
+        pa.field("person_count", pa.int64(), nullable=False),
+        pa.field("total_steps", pa.int64(), nullable=False),
+        pa.field("ge_8000_count", pa.int64(), nullable=False),
+    ]
+)
+
+
+def write_stats_result(rows: list[dict], final_path: Path) -> None:
+    """把按日结果原子写为 Parquet（与批次同样的临时文件 + fsync + rename 语义）。"""
+    table = pa.table(
+        {
+            "stat_date": [r["stat_date"] for r in rows],
+            "person_count": [r["person_count"] for r in rows],
+            "total_steps": [r["total_steps"] for r in rows],
+            "ge_8000_count": [r["ge_8000_count"] for r in rows],
+        },
+        schema=STATS_RESULT_SCHEMA,
+    )
+    atomic_write_parquet(table, final_path)

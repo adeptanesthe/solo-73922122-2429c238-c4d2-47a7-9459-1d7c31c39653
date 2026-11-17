@@ -20,9 +20,11 @@ def _activate_data_dir(path: str) -> None:
     config.DB_PATH = data / "stepstore.db"
     config.BATCHES_DIR = data / "batches"
     config.STAGING_DIR = data / "staging"
+    config.STATS_DIR = data / "stats"
     config.LOCK_DIR = data / "locks"
     config.PUBLISH_LOCK = config.LOCK_DIR / "publish.lock"
     config.WITHDRAW_LOCK = config.LOCK_DIR / "withdraw.lock"
+    config.STATS_LOCK = config.LOCK_DIR / "stats.lock"
     if hasattr(db._local, "conn"):
         try:
             db._local.conn.close()
@@ -67,3 +69,26 @@ def wait_completed(client, subject_id, timeout_seconds=10.0):
         if last["status"] in ("completed", "failed"):
             return last
     raise AssertionError(f"withdrawal {subject_id} did not finish: {last}")
+
+
+def run_stats_once():
+    """同步驱动一次日统计 worker（测试中后台线程关闭）。"""
+    from app import services
+
+    return services.process_due_daily_stats()
+
+
+def wait_stats_terminal(client, job_id, timeout_seconds=10.0):
+    """轮询驱动统计 worker 直到作业进入终态（ready/failed/invalidated）。"""
+    import time
+
+    from app import services
+
+    deadline = time.monotonic() + timeout_seconds
+    last = None
+    while time.monotonic() < deadline:
+        services.process_due_daily_stats()
+        last = client.get(f"/api/daily-stats/{job_id}").json()
+        if last["status"] in ("ready", "failed", "invalidated"):
+            return last
+    raise AssertionError(f"stats job {job_id} did not finish: {last}")

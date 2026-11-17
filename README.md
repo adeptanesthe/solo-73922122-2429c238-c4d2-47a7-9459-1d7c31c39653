@@ -12,6 +12,8 @@
 - 重写期间禁止这些批次的**新**下载，**已开始**的下载因持有旧文件句柄可正常读完；
 - 共享卷内含该受试者的旧版本与暂存件全部清除并复核后，才把任务标记为完成；
 - 写入失败或进程退出后重启可接续，不会恢复旧下载、不会误报完成；重复撤回接续同一任务；
+- **日统计网页**：选择日期范围生成按日统计（人数、步数总和、≥8000 步人数），
+  受理时冻结来源批次与撤回名单，撤回立即永久停供相关结果；
 - Docker Compose 启动**共用一个数据卷的两个应用实例**，浏览器在任一端口均可操作。
 
 ## 目录结构
@@ -19,14 +21,15 @@
 ```
 app/
   config.py          # 路径与上传限制（全部位于共享数据卷）
-  locks.py           # 跨进程 fcntl.flock 互斥锁
+  locks.py           # 跨进程 fcntl.flock 互斥锁（publish/withdraw/stats）
   db.py              # SQLite（WAL）连接、schema 与并发初始化重试
-  parquet_store.py   # CSV 内存解析/校验、Parquet 原子写、批次重写、卷扫描
-  services.py        # 发布、撤回受理、后台清理、崩溃恢复（核心业务）
+  parquet_store.py   # CSV 内存解析/校验、Parquet 原子写、批次重写、统计读取与结果写盘
+  services.py        # 发布、撤回受理、日统计作业、后台清理、崩溃恢复（核心业务）
   main.py            # FastAPI 路由、后台 worker、内嵌单页前端
-tests/               # 23 个 pytest 用例（校验/撤回/恢复/并发）
+tests/               # 39 个 pytest 用例（校验/撤回/恢复/并发/日统计）
 scripts/
-  e2e.sh             # 双实例共享卷端到端自测
+  e2e.sh             # 双实例共享卷端到端自测（撤回）
+  e2e_daily_stats.sh # 双实例共享卷端到端自测（日统计与撤回联动）
   restart_recovery.sh# 崩溃 → 重启 → 接续完成验证
 Dockerfile
 docker-compose.yml   # app1:8001、app2:8002，共享命名卷 stepdata
@@ -44,8 +47,9 @@ docker compose up --build
 ```
 /data/
   stepstore.db(-wal/-shm)      # SQLite 数据库（WAL 模式）
-  locks/{publish,withdraw}.lock# 跨进程文件锁
+  locks/{publish,withdraw,stats}.lock # 跨进程文件锁
   staging/import-<uuid>.parquet# 暂存 Parquet（发布成功即移走）
+  stats/stats-00000001.parquet # 日统计结果（失效即删除，只保留可供数的结果）
   batches/batch-00000001/
       v1.parquet               # 版本化批次文件，撤回重写生成 v2、v3…
 ```
@@ -69,6 +73,11 @@ STEP_DATA_DIR=./data uvicorn app.main:app --port 8001
 | POST | `/api/withdrawals` | `{"subject_id":"S001"}` 受理撤回（重复调用返回同一任务） |
 | GET  | `/api/withdrawals` | 全部撤回任务与进度 |
 | GET  | `/api/withdrawals/{subject_id}` | 单个任务进度 |
+| POST | `/api/daily-stats` | `{"start_date":"2026-11-01","end_date":"2026-11-30"}` 受理日统计；重写中 409 |
+| GET  | `/api/daily-stats` | 全部统计作业（状态、来源行数、失效原因摘要） |
+| GET  | `/api/daily-stats/{id}` | 作业详情：冻结来源批次、排除名单、冲突明细、失效记录 |
+| GET  | `/api/daily-stats/{id}/results` | 按日结果；失效 410、失败 422、计算中 409 |
+| GET  | `/api/daily-stats/{id}/download` | 下载结果 Parquet；失效 410 |
 | GET  | `/healthz` | 健康检查与本次启动恢复统计 |
 
 CSV 表头支持英文 `subject_id,date,steps` 与中文 `受试者号,日期,步数`。
@@ -119,16 +128,47 @@ CSV 表头支持英文 `subject_id,date,steps` 与中文 `受试者号,日期,�
 上传接口最多读取 256 KiB+1 字节到内存，随后用 `io.StringIO` 在内存解析；
 写入磁盘的第一个产物是 `staging/import-<uuid>.parquet`。测试断言数据卷内不存在任何 `.csv`。
 
+### 6. 日统计：冻结快照、冲突失败与撤回联动
+
+- **受理即冻结**：`POST /api/daily-stats` 在 `publish.lock` 内快照受理时刻全部
+  `published` 批次（路径 + 文件大小 + mtime_ns 签名）、受理时已撤回者排除名单，
+  并构建作业覆盖受试者表 `daily_stats_job_subjects`。**受理之后的导入不在快照内**，
+  天然不加入本次统计；存在 `rewriting` 批次时直接 409，暂不受理。
+- **慢统计不阻塞业务**：重计算在独立的 `stats.lock` 下由后台 worker 执行，不长占
+  `publish.lock`，因此统计期间导入与撤回受理均可继续（有并发测试覆盖）。
+- **同人同日规则**：同一受试者同一天的多条同值记录只计一次；出现异值则**整次失败**，
+  `daily_stats_conflicts` 逐组记录每个值及其来源批次，前端与详情接口可直接列出；
+  失败只落失败状态与冲突明细，不产生任何结果行或结果文件。
+- **结果、来源与供数资格一起生效**：结果 Parquet 先原子写到 `stats/`，再在
+  `publish.lock` 事务内复核（作业未被失效 + 冻结文件签名未变）后，同事务写入
+  `daily_stats_results` 并翻转为 `ready`；复核不过则删除结果文件并置 `failed`，
+  **失败不留半份结果**。
+- **撤回立即永久停供**：撤回受理事务内，依据覆盖表精确命中相关作业（无关撤回不影响），
+  同事务翻转为 `invalidated`、删除结果行、登记失效原因，事务提交后删除结果 Parquet。
+  统计期间受理的撤回会让在途作业在发布复核时命中 `withdrawals` 而**不予发布**，须重新生成。
+- **重启后仍成立**：启动恢复会对停机期间遗漏的撤回做失效兜底（仍按覆盖表精确判定）、
+  删除无 `ready` 引用的孤儿结果、把丢失结果文件的 `ready` 作业转 `failed`；
+  `processing` 作业由 worker 幂等接续。
+
+### 7. 双实例交错与锁体系
+
+- 两个容器挂载同一命名卷，SQLite（WAL + busy_timeout）、Parquet 与三把 flock 均在卷内；
+  两个实例的 worker 通过 `withdraw.lock` / `stats.lock` 互斥，同一类任务全局只跑一个，
+  另一个实例空转；在任一端口受理的统计/撤回，另一端立即可见同一状态与结果。
+
 ## 自测
 
 ```bash
 pip install -r requirements.txt pytest httpx
 pytest tests/ -q
 PYLIB=$(python -c 'import site;print(site.getsitepackages()[0])') bash scripts/e2e.sh
+PYLIB=... bash scripts/e2e_daily_stats.sh
 PYLIB=... bash scripts/restart_recovery.sh
 ```
 
 测试覆盖：上传大小/行数/字段/编码校验、CSV 不落盘、撤回重写内容正确性、
 重写窗口 409 封锁、已开始下载不受影响、旧版本清理与全卷复核、
 重复撤回幂等、在途暂存导入被清扫、模拟崩溃后重启接续、双 worker 锁互斥、
-受理/发布并发全序等。
+受理/发布并发全序；日统计的按日聚合与同值去重、≥8000 计数、受理快照排除后续导入、
+同人同日异值整次失败与来源批次明细、重写中不受理、撤回即时停供（410）与结果文件删除、
+在途统计遇撤回不发布、慢统计期间业务不阻塞、无关撤回不误伤、重启恢复与孤儿清理等。

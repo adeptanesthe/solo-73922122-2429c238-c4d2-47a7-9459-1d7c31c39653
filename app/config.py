@@ -9,9 +9,11 @@ DATA_DIR = Path(os.environ.get("STEP_DATA_DIR", "/data"))
 DB_PATH = DATA_DIR / "stepstore.db"
 BATCHES_DIR = DATA_DIR / "batches"
 STAGING_DIR = DATA_DIR / "staging"
+STATS_DIR = DATA_DIR / "stats"
 LOCK_DIR = DATA_DIR / "locks"
 PUBLISH_LOCK = LOCK_DIR / "publish.lock"
 WITHDRAW_LOCK = LOCK_DIR / "withdraw.lock"
+STATS_LOCK = LOCK_DIR / "stats.lock"
 
 # 上传限制：每批不超过 256 KiB、1000 行
 MAX_UPLOAD_BYTES = 256 * 1024
@@ -26,5 +28,5 @@ PARQUET_MEDIA_TYPE = "application/vnd.apache.parquet"
 
 
 def ensure_dirs() -> None:
-    for p in (DATA_DIR, BATCHES_DIR, STAGING_DIR, LOCK_DIR):
+    for p in (DATA_DIR, BATCHES_DIR, STAGING_DIR, STATS_DIR, LOCK_DIR):
         p.mkdir(parents=True, exist_ok=True)
